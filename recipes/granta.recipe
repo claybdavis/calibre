@@ -33,10 +33,11 @@ class Granta(BasicNewsRecipe):
     # and most of a recently-closed one.
     NUM_FEED_PAGES = 6
 
-    # Spacing between sequential thumbnail-image fetches. Cloudflare rate-limits
+    # Spacing between sequential image fetches. Cloudflare rate-limits
     # granta.com image requests: at 0.5s spacing it challenges roughly 2/3 of
-    # fetches; at 3s spacing it lets everything through.
-    THUMBNAIL_FETCH_DELAY = 3.0
+    # fetches; at 3s spacing it lets nearly all through; 4s gives margin for the
+    # adaptive heuristic that ramps up suspicion over the course of a long run.
+    IMAGE_FETCH_DELAY = 4.0
 
     remove_tags = [
         dict(attrs={'class': lambda x: x and 'litbreaker' in ' '.join(x).lower()}),
@@ -151,6 +152,7 @@ class Granta(BasicNewsRecipe):
             self.log('  [%s] %s%s' % (section, title, '' if in_feed else ' (no RSS body)'))
 
         self._thumbnail_data = self._fetch_thumbnails()
+        self._inline_images_into_bodies()
         return [(sec, sections[sec]) for sec in section_order]
 
     def _download_image_to_tempfile(self, url, prefix='granta_'):
@@ -182,7 +184,7 @@ class Granta(BasicNewsRecipe):
         self.log('Granta: fetching %d thumbnails sequentially' % len(with_thumb))
         for i, (article_url, meta) in enumerate(with_thumb):
             if i > 0:
-                time.sleep(self.THUMBNAIL_FETCH_DELAY)
+                time.sleep(self.IMAGE_FETCH_DELAY)
             thumb_url = meta['thumbnail']
             try:
                 body = self.browser.open(thumb_url).read()
@@ -201,6 +203,56 @@ class Granta(BasicNewsRecipe):
             thumbs[article_url] = 'data:%s;base64,%s' % (mime, base64.b64encode(body).decode('ascii'))
         self.log('Granta: %d/%d thumbnails captured' % (len(thumbs), len(with_thumb)))
         return thumbs
+
+    def _inline_images_into_bodies(self):
+        '''Some RSS bodies contain inline <img> tags pointing to
+        granta.com/wp-content/. Calibre's downloader would otherwise fetch
+        those in parallel after parse_index and get a chunk Cloudflare-
+        challenged, leaving broken images in the EPUB. Pre-fetch each one
+        sequentially with delay and rewrite the bodies to embed them as base64
+        data URLs so calibre never re-fetches.'''
+        import base64
+        import time
+        img_url_re = re.compile(r'<img[^>]+src=["\'](https?://granta\.com/wp-content/[^"\']+)["\']', re.IGNORECASE)
+        urls = set()
+        for body in self._content_map.values():
+            for u in img_url_re.findall(body):
+                urls.add(u)
+        if not urls:
+            return
+        urls = sorted(urls)
+        self.log('Granta: fetching %d inline article images sequentially' % len(urls))
+        url_to_data = {}
+        for i, url in enumerate(urls):
+            if i > 0:
+                time.sleep(self.IMAGE_FETCH_DELAY)
+            try:
+                body = self.browser.open(url).read()
+            except Exception as e:
+                self.log.warning('  inline image fetch failed for %s: %s' % (url, e))
+                continue
+            if not body or body[:200].startswith(b'<') or b'Just a moment' in body[:500]:
+                self.log.warning('  inline image challenged: %s' % url)
+                continue
+            ext = url.rsplit('.', 1)[-1].lower().split('?')[0]
+            mime = {
+                'png': 'image/png',
+                'webp': 'image/webp',
+                'gif': 'image/gif',
+            }.get(ext, 'image/jpeg')
+            url_to_data[url] = 'data:%s;base64,%s' % (mime, base64.b64encode(body).decode('ascii'))
+        self.log('Granta: %d/%d inline images captured' % (len(url_to_data), len(urls)))
+        if not url_to_data:
+            return
+        # Rewrite each body in self._content_map, replacing fetched URLs with data URLs.
+        for article_url, body in list(self._content_map.items()):
+            def replace(m, body=body):
+                src = m.group(1)
+                data_url = url_to_data.get(src)
+                if data_url is None:
+                    return m.group(0)
+                return m.group(0).replace(src, data_url)
+            self._content_map[article_url] = img_url_re.sub(replace, body)
 
     def get_obfuscated_article(self, url):
         meta = self._article_meta.get(url, {})
