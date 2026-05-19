@@ -6,7 +6,9 @@ __docformat__ = 'restructuredtext en'
 '''
 granta.com
 '''
+import os
 import re
+import tempfile
 
 from calibre.web.feeds.news import BasicNewsRecipe
 
@@ -20,21 +22,21 @@ class Granta(BasicNewsRecipe):
     __author__ = 'Gary Arnold'
 
     browser_type = 'webengine'
-    oldest_article = 90
-    max_articles_per_feed = 50
-    use_embedded_content = True
     no_stylesheets = True
     remove_javascript = True
     auto_cleanup = False
+    articles_are_obfuscated = True
 
-    # The granta.com WordPress RSS feed paginates with 10 items per page and embeds
-    # full article HTML in <content:encoded>. Fetching the feed avoids the Cloudflare
-    # Managed Challenge that gates /issues, per-issue pages, and individual article URLs.
-    feeds = [
-        ('Granta', 'https://granta.com/feed/'),
-        ('Granta (earlier)', 'https://granta.com/feed/?paged=2'),
-        ('Granta (earlier still)', 'https://granta.com/feed/?paged=3'),
-    ]
+    # How many pages of the WordPress RSS feed to pull (10 items per page).
+    # The current issue typically has 30-50 articles spread across recent months,
+    # so 6 pages = 60 items is enough to cover an issue that's still publishing
+    # and most of a recently-closed one.
+    NUM_FEED_PAGES = 6
+
+    # Spacing between sequential thumbnail-image fetches. Cloudflare rate-limits
+    # granta.com image requests: at 0.5s spacing it challenges roughly 2/3 of
+    # fetches; at 3s spacing it lets everything through.
+    THUMBNAIL_FETCH_DELAY = 3.0
 
     remove_tags = [
         dict(attrs={'class': lambda x: x and 'litbreaker' in ' '.join(x).lower()}),
@@ -42,31 +44,181 @@ class Granta(BasicNewsRecipe):
         dict(name='noscript'),
     ]
 
-    def get_cover_url(self):
-        # Find the latest issue URL from the home page and pull the cover image from
-        # the issue page. Two webengine fetches -- few enough that Cloudflare's
-        # heuristic typically lets them through.
-        try:
-            home = self.index_to_soup('https://granta.com/')
-        except Exception as e:
-            self.log.warning('Granta cover: home page fetch failed: %s' % e)
-            return None
+    def _build_content_map(self):
+        '''Pull `NUM_FEED_PAGES` pages of the WordPress RSS feed and return a
+        dict mapping article URL (no trailing slash) -> the full HTML body
+        from <content:encoded>.'''
+        from calibre.web.feeds.feedparser import parse
+        content_map = {}
+        for page in range(1, self.NUM_FEED_PAGES + 1):
+            url = 'https://granta.com/feed/' if page == 1 else 'https://granta.com/feed/?paged={}'.format(page)
+            try:
+                raw = self.browser.open(url).read()
+            except Exception as e:
+                self.log.warning('Granta feed page %d fetch failed: %s' % (page, e))
+                continue
+            feed = parse(raw)
+            for entry in feed.get('entries', []):
+                link = entry.get('link', '').rstrip('/')
+                if not link:
+                    continue
+                body = ''
+                if entry.get('content'):
+                    body = entry['content'][0].get('value', '')
+                if not body:
+                    body = entry.get('summary', '')
+                if body:
+                    content_map[link] = body
+        self.log('Granta: collected %d article bodies from RSS' % len(content_map))
+        return content_map
+
+    def parse_index(self):
+        # Find the latest issue URL on the home page. The home page is reachable
+        # without solving Cloudflare's challenge.
+        home = self.index_to_soup('https://granta.com/')
         issue_url = None
         for a in home.find_all('a', href=True):
             if re.match(r'^https?://granta\.com/products/granta-\d+', a['href']):
                 issue_url = a['href']
                 break
         if not issue_url:
-            return None
+            raise ValueError('Could not find a Granta issue link on the home page')
+        self.log('Granta: latest issue at', issue_url)
+
+        # One webengine fetch of the issue page gets us cover, TOC, sections,
+        # author, description, and per-article thumbnail URLs in one shot.
+        issue = self.index_to_soup(issue_url)
+        if issue.find('title') is not None and 'Just a moment' in self.tag_to_string(issue.find('title')):
+            raise ValueError(
+                'granta.com served a Cloudflare challenge instead of the issue page. '
+                'Try running the recipe again in a few minutes.')
+
+        cover_div = issue.find('div', class_='single-issue__cover-image')
+        if cover_div is not None and cover_div.get('data-background'):
+            remote = cover_div['data-background']
+            self.log('Granta: cover at', remote)
+            # Fetch the cover image up front, while Cloudflare's rate-limit
+            # budget is fresh; if we defer it to calibre's normal cover-download
+            # pass it lands after 40+ thumbnail fetches and gets challenged.
+            local = self._download_image_to_tempfile(remote, prefix='granta_cover_')
+            self.cover_url = local or remote
+
+        # Pre-fetch the RSS bodies for all articles we'll match.
+        self._content_map = self._build_content_map()
+        self._article_meta = {}
+
+        sections = {}
+        section_order = []
+        rows = issue.find_all(class_='single-contributor_related-row_container')
+        for row in rows:
+            title_tag = row.find('h1', class_='single-contributor_related-header')
+            if title_tag is None:
+                continue
+            title = self.tag_to_string(title_tag).strip()
+            title_anchor = title_tag.find_parent('a', href=True)
+            url = title_anchor['href'] if title_anchor is not None else None
+            if not (url and title):
+                continue
+            section = 'Articles'
+            section_tag = row.find('h6', class_='single-contributor_related_header-text-desktop')
+            if section_tag is not None:
+                first_a = section_tag.find('a')
+                if first_a is not None:
+                    section = self.tag_to_string(first_a).strip()
+            author_tag = row.find('h3', class_='single-contributor_related-meta')
+            author = self.tag_to_string(author_tag).strip() if author_tag is not None else ''
+            thumb_div = row.find('div', class_='single-contributor_related__image')
+            thumb = thumb_div.get('data-background') if thumb_div is not None else None
+            desc_tag = row.find('p')
+            description = self.tag_to_string(desc_tag).strip() if desc_tag is not None else ''
+
+            if section not in sections:
+                sections[section] = []
+                section_order.append(section)
+            sections[section].append({
+                'title': title,
+                'url': url,
+                'description': ('by ' + author + '. ' + description) if author else description,
+            })
+            self._article_meta[url] = {
+                'title': title,
+                'author': author,
+                'thumbnail': thumb,
+                'description': description,
+            }
+
+            in_feed = url.rstrip('/') in self._content_map
+            self.log('  [%s] %s%s' % (section, title, '' if in_feed else ' (no RSS body)'))
+
+        self._thumbnail_data = self._fetch_thumbnails()
+        return [(sec, sections[sec]) for sec in section_order]
+
+    def _download_image_to_tempfile(self, url, prefix='granta_'):
         try:
-            issue = self.index_to_soup(issue_url)
+            data = self.browser.open(url).read()
         except Exception as e:
-            self.log.warning('Granta cover: issue page fetch failed: %s' % e)
+            self.log.warning('Granta: image fetch failed for %s: %s' % (url, e))
             return None
-        cover = issue.find('div', class_='single-issue__cover-image')
-        if cover is not None and cover.get('data-background'):
-            return cover['data-background']
-        og = issue.find('meta', attrs={'property': 'og:image'})
-        if og and og.get('content'):
-            return og['content']
-        return None
+        if not data or data[:200].startswith(b'<') or b'Just a moment' in data[:500]:
+            self.log.warning('Granta: image challenged: %s' % url)
+            return None
+        ext = url.rsplit('.', 1)[-1].lower()
+        if ext not in ('jpg', 'jpeg', 'png', 'webp', 'gif'):
+            ext = 'jpg'
+        fd, path = tempfile.mkstemp(suffix='.' + ext, prefix=prefix)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        return path
+
+    def _fetch_thumbnails(self):
+        '''Pre-fetch each article's thumbnail image and return a dict mapping
+        article URL -> data: URL. Calibre's image fetcher would otherwise
+        download these in parallel and get most of them Cloudflare-challenged;
+        sequential fetches with a few seconds of spacing avoid the rate limit.'''
+        import base64
+        import time
+        thumbs = {}
+        with_thumb = [(u, m) for u, m in self._article_meta.items() if m.get('thumbnail')]
+        self.log('Granta: fetching %d thumbnails sequentially' % len(with_thumb))
+        for i, (article_url, meta) in enumerate(with_thumb):
+            if i > 0:
+                time.sleep(self.THUMBNAIL_FETCH_DELAY)
+            thumb_url = meta['thumbnail']
+            try:
+                body = self.browser.open(thumb_url).read()
+            except Exception as e:
+                self.log.warning('  thumbnail fetch failed for %s: %s' % (thumb_url, e))
+                continue
+            if not body or body[:200].startswith(b'<') or b'Just a moment' in body[:500]:
+                self.log.warning('  thumbnail challenged or non-image: %s' % thumb_url)
+                continue
+            ext = thumb_url.rsplit('.', 1)[-1].lower()
+            mime = {
+                'png': 'image/png',
+                'webp': 'image/webp',
+                'gif': 'image/gif',
+            }.get(ext, 'image/jpeg')
+            thumbs[article_url] = 'data:%s;base64,%s' % (mime, base64.b64encode(body).decode('ascii'))
+        self.log('Granta: %d/%d thumbnails captured' % (len(thumbs), len(with_thumb)))
+        return thumbs
+
+    def get_obfuscated_article(self, url):
+        meta = self._article_meta.get(url, {})
+        body = self._content_map.get(url.rstrip('/'), '')
+        parts = ['<html><head><meta charset="utf-8"/><title>']
+        parts.append(meta.get('title', 'Granta'))
+        parts.append('</title></head><body>')
+        parts.append('<h1>%s</h1>' % meta.get('title', ''))
+        if meta.get('author'):
+            parts.append('<h3>%s</h3>' % meta['author'])
+        thumb_src = self._thumbnail_data.get(url) or meta.get('thumbnail')
+        if thumb_src:
+            parts.append('<p><img src="%s" alt=""/></p>' % thumb_src)
+        if body:
+            parts.append(body)
+        else:
+            parts.append(
+                '<p><em>This article is not available in the Granta RSS feed cache. '
+                'Read the full piece at <a href="%s">%s</a>.</em></p>' % (url, url))
+        parts.append('</body></html>')
+        return {'data': ''.join(parts), 'url': url}
