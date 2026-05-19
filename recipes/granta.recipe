@@ -6,6 +6,8 @@ __docformat__ = 'restructuredtext en'
 '''
 granta.com
 '''
+import re
+
 from calibre.web.feeds.news import BasicNewsRecipe
 
 
@@ -17,6 +19,7 @@ class Granta(BasicNewsRecipe):
 
     __author__ = 'Gary Arnold'
 
+    browser_type = 'webengine'
     oldest_article = 90
     max_articles_per_feed = 50
     use_embedded_content = True
@@ -38,3 +41,32 @@ class Granta(BasicNewsRecipe):
         dict(name='script'),
         dict(name='noscript'),
     ]
+
+    def get_cover_url(self):
+        # Find the latest issue URL from the home page and pull the cover image from
+        # the issue page. Two webengine fetches -- few enough that Cloudflare's
+        # heuristic typically lets them through.
+        try:
+            home = self.index_to_soup('https://granta.com/')
+        except Exception as e:
+            self.log.warning('Granta cover: home page fetch failed: %s' % e)
+            return None
+        issue_url = None
+        for a in home.find_all('a', href=True):
+            if re.match(r'^https?://granta\.com/products/granta-\d+', a['href']):
+                issue_url = a['href']
+                break
+        if not issue_url:
+            return None
+        try:
+            issue = self.index_to_soup(issue_url)
+        except Exception as e:
+            self.log.warning('Granta cover: issue page fetch failed: %s' % e)
+            return None
+        cover = issue.find('div', class_='single-issue__cover-image')
+        if cover is not None and cover.get('data-background'):
+            return cover['data-background']
+        og = issue.find('meta', attrs={'property': 'og:image'})
+        if og and og.get('content'):
+            return og['content']
+        return None
