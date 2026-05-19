@@ -6,17 +6,34 @@ __docformat__ = 'restructuredtext en'
 '''
 granta.com
 '''
+import base64
 import os
 import re
-import tempfile
+import time
 
+from calibre.ptempfile import PersistentTemporaryFile
+from calibre.utils.img import NotImage, image_from_data
+from calibre.web.feeds.feedparser import parse as parse_feed
 from calibre.web.feeds.news import BasicNewsRecipe
+
+_LATEST_ISSUE_URL_RE = re.compile(r'^https?://granta\.com/products/granta-\d+')
+_GRANTA_IMG_RE = re.compile(
+    r'<img[^>]+src=["\'](https?://granta\.com/wp-content/[^"\']+)["\']',
+    re.IGNORECASE,
+)
+_EXT_TO_MIME = {
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'png': 'image/png',
+    'webp': 'image/webp',
+    'gif': 'image/gif',
+}
 
 
 class Granta(BasicNewsRecipe):
 
-    title = u'Granta'
-    description = u'The Magazine of New Writing'
+    title = 'Granta'
+    description = 'The Magazine of New Writing'
     language = 'en'
 
     __author__ = 'Gary Arnold'
@@ -27,250 +44,323 @@ class Granta(BasicNewsRecipe):
     auto_cleanup = False
     articles_are_obfuscated = True
 
-    # How many pages of the WordPress RSS feed to pull (10 items per page).
-    # The current issue typically has 30-50 articles spread across recent months,
-    # so 6 pages = 60 items is enough to cover an issue that's still publishing
-    # and most of a recently-closed one.
-    NUM_FEED_PAGES = 6
-
-    # Spacing between sequential image fetches. Cloudflare rate-limits
-    # granta.com image requests: at 0.5s spacing it challenges roughly 2/3 of
-    # fetches; at 3s spacing it lets nearly all through; 4s gives margin for the
-    # adaptive heuristic that ramps up suspicion over the course of a long run.
-    IMAGE_FETCH_DELAY = 4.0
-
     remove_tags = [
-        dict(attrs={'class': lambda x: x and 'litbreaker' in ' '.join(x).lower()}),
-        dict(name='script'),
-        dict(name='noscript'),
+        dict(name=['script', 'noscript']),
     ]
 
-    def _build_content_map(self):
-        '''Pull `NUM_FEED_PAGES` pages of the WordPress RSS feed and return a
-        dict mapping article URL (no trailing slash) -> the full HTML body
-        from <content:encoded>.'''
-        from calibre.web.feeds.feedparser import parse
-        content_map = {}
-        for page in range(1, self.NUM_FEED_PAGES + 1):
-            url = 'https://granta.com/feed/' if page == 1 else 'https://granta.com/feed/?paged={}'.format(page)
-            try:
-                raw = self.browser.open(url).read()
-            except Exception as e:
-                self.log.warning('Granta feed page %d fetch failed: %s' % (page, e))
-                continue
-            feed = parse(raw)
-            for entry in feed.get('entries', []):
-                link = entry.get('link', '').rstrip('/')
-                if not link:
-                    continue
-                body = ''
-                if entry.get('content'):
-                    body = entry['content'][0].get('value', '')
-                if not body:
-                    body = entry.get('summary', '')
-                if body:
-                    content_map[link] = body
-        self.log('Granta: collected %d article bodies from RSS' % len(content_map))
-        return content_map
+    recipe_specific_options = {
+        'feed_pages': {
+            'short': 'Pages of granta.com/feed/ to pull (10 articles per page)',
+            'long': (
+                "Granta's WordPress RSS feed paginates with 10 items per page. "
+                'The default of 6 pages (up to 60 articles) covers a currently-publishing '
+                'issue; raise for older issues whose articles have aged out of more recent '
+                'feed pages.'
+            ),
+            'default': '6',
+        },
+        'image_delay': {
+            'short': 'Seconds between sequential image fetches',
+            'long': (
+                'Cloudflare rate-limits granta.com image requests aggressively. At 4s '
+                'spacing nearly all fetches succeed; lower this to speed up the recipe at '
+                'the cost of broken images, or raise it if you see "image challenged" '
+                'warnings in the log.'
+            ),
+            'default': '4.0',
+        },
+    }
+
+    # Tunable defaults, resolved at run time from recipe_specific_options.
+    NUM_FEED_PAGES = 6
+    IMAGE_FETCH_DELAY = 4.0
+
+    # --------------------------------------------------------------- entry point
 
     def parse_index(self):
-        # Find the latest issue URL on the home page. The home page is reachable
-        # without solving Cloudflare's challenge.
+        self._resolve_options()
+        self._article_meta = {}
+        self._cover_local_path = None
+
+        issue_soup = self._fetch_issue_soup()
+        self._download_cover_from(issue_soup)
+        self._content_map = self._build_content_map()
+        sections = self._parse_sections(issue_soup)
+
+        if not sections:
+            self.log.warning(
+                'Granta: no articles parsed from the issue page. The class names may have '
+                'changed, or Cloudflare may be serving a challenge variant we did not detect.'
+            )
+
+        self._thumbnail_data = self._fetch_thumbnails()
+        self._inline_images_into_bodies()
+        return list(sections.items())
+
+    # ----------------------------------------------------------------- options
+
+    def _resolve_options(self):
+        opts = self.recipe_specific_options or {}
+        if opts.get('feed_pages'):
+            try:
+                self.NUM_FEED_PAGES = int(opts['feed_pages'])
+            except (TypeError, ValueError):
+                self.log.warning(f'Granta: ignoring invalid feed_pages={opts["feed_pages"]!r}')
+        if opts.get('image_delay'):
+            try:
+                self.IMAGE_FETCH_DELAY = float(opts['image_delay'])
+            except (TypeError, ValueError):
+                self.log.warning(f'Granta: ignoring invalid image_delay={opts["image_delay"]!r}')
+
+    # ----------------------------------------------------------- discovery / TOC
+
+    def _fetch_issue_soup(self):
         home = self.index_to_soup('https://granta.com/')
-        issue_url = None
-        for a in home.find_all('a', href=True):
-            if re.match(r'^https?://granta\.com/products/granta-\d+', a['href']):
-                issue_url = a['href']
-                break
+        issue_url = next(
+            (a['href'] for a in home.find_all('a', href=True)
+             if _LATEST_ISSUE_URL_RE.match(a['href'])),
+            None,
+        )
         if not issue_url:
             raise ValueError('Could not find a Granta issue link on the home page')
-        self.log('Granta: latest issue at', issue_url)
-
-        # One webengine fetch of the issue page gets us cover, TOC, sections,
-        # author, description, and per-article thumbnail URLs in one shot.
-        issue = self.index_to_soup(issue_url)
-        if issue.find('title') is not None and 'Just a moment' in self.tag_to_string(issue.find('title')):
+        self.log(f'Granta: latest issue at {issue_url}')
+        soup = self.index_to_soup(issue_url)
+        if self._looks_like_cloudflare_challenge(soup):
             raise ValueError(
                 'granta.com served a Cloudflare challenge instead of the issue page. '
-                'Try running the recipe again in a few minutes.')
+                'Try running the recipe again in a few minutes.'
+            )
+        return soup
 
-        cover_div = issue.find('div', class_='single-issue__cover-image')
-        if cover_div is not None and cover_div.get('data-background'):
-            remote = cover_div['data-background']
-            self.log('Granta: cover at', remote)
-            # Fetch the cover image up front, while Cloudflare's rate-limit
-            # budget is fresh; if we defer it to calibre's normal cover-download
-            # pass it lands after 40+ thumbnail fetches and gets challenged.
-            local = self._download_image_to_tempfile(remote, prefix='granta_cover_')
-            self.cover_url = local or remote
+    @staticmethod
+    def _looks_like_cloudflare_challenge(soup):
+        title = soup.find('title')
+        if title is not None and 'just a moment' in title.get_text().lower():
+            return True
+        # The CF challenge page always inlines a script that sets _cf_chl_opt.
+        return any(
+            s.string and '_cf_chl_opt' in s.string
+            for s in soup.find_all('script')
+        )
 
-        # Pre-fetch the RSS bodies for all articles we'll match.
-        self._content_map = self._build_content_map()
-        self._article_meta = {}
-
-        sections = {}
-        section_order = []
-        rows = issue.find_all(class_='single-contributor_related-row_container')
-        for row in rows:
+    def _parse_sections(self, issue_soup):
+        '''Walk each article row on the issue page; group articles into sections
+        in the order they appear; stash thumbnail/author/title on
+        ``self._article_meta`` for later assembly.'''
+        sections = {}  # ordered; Python 3.7+ dicts preserve insertion order
+        for row in issue_soup.find_all(class_='single-contributor_related-row_container'):
             title_tag = row.find('h1', class_='single-contributor_related-header')
             if title_tag is None:
                 continue
             title = self.tag_to_string(title_tag).strip()
             title_anchor = title_tag.find_parent('a', href=True)
-            url = title_anchor['href'] if title_anchor is not None else None
-            if not (url and title):
+            if title_anchor is None or not title:
                 continue
+            url = title_anchor['href']
+
             section = 'Articles'
             section_tag = row.find('h6', class_='single-contributor_related_header-text-desktop')
             if section_tag is not None:
                 first_a = section_tag.find('a')
                 if first_a is not None:
-                    section = self.tag_to_string(first_a).strip()
+                    section = self.tag_to_string(first_a).strip() or section
+
             author_tag = row.find('h3', class_='single-contributor_related-meta')
             author = self.tag_to_string(author_tag).strip() if author_tag is not None else ''
+
             thumb_div = row.find('div', class_='single-contributor_related__image')
             thumb = thumb_div.get('data-background') if thumb_div is not None else None
+
             desc_tag = row.find('p')
             description = self.tag_to_string(desc_tag).strip() if desc_tag is not None else ''
 
-            if section not in sections:
-                sections[section] = []
-                section_order.append(section)
-            sections[section].append({
+            sections.setdefault(section, []).append({
                 'title': title,
                 'url': url,
-                'description': ('by ' + author + '. ' + description) if author else description,
+                'description': f'by {author}. {description}' if author else description,
             })
             self._article_meta[url] = {
                 'title': title,
                 'author': author,
                 'thumbnail': thumb,
-                'description': description,
             }
 
             in_feed = url.rstrip('/') in self._content_map
-            self.log('  [%s] %s%s' % (section, title, '' if in_feed else ' (no RSS body)'))
+            tag = '' if in_feed else ' (no RSS body)'
+            self.log(f'  [{section}] {title}{tag}')
+        return sections
 
-        self._thumbnail_data = self._fetch_thumbnails()
-        self._inline_images_into_bodies()
-        return [(sec, sections[sec]) for sec in section_order]
+    # ------------------------------------------------------------------ cover
 
-    def _download_image_to_tempfile(self, url, prefix='granta_'):
-        try:
-            data = self.browser.open(url).read()
-        except Exception as e:
-            self.log.warning('Granta: image fetch failed for %s: %s' % (url, e))
-            return None
-        if not data or data[:200].startswith(b'<') or b'Just a moment' in data[:500]:
-            self.log.warning('Granta: image challenged: %s' % url)
-            return None
-        ext = url.rsplit('.', 1)[-1].lower()
-        if ext not in ('jpg', 'jpeg', 'png', 'webp', 'gif'):
-            ext = 'jpg'
-        fd, path = tempfile.mkstemp(suffix='.' + ext, prefix=prefix)
-        with os.fdopen(fd, 'wb') as f:
-            f.write(data)
-        return path
+    def _download_cover_from(self, issue_soup):
+        '''Fetch the cover image up front, while Cloudflare's rate-limit budget
+        is fresh. If we deferred it to calibre's normal cover-download pass the
+        request would land after ~100 image fetches and get challenged.'''
+        cover_div = issue_soup.find('div', class_='single-issue__cover-image')
+        if cover_div is None or not cover_div.get('data-background'):
+            return
+        remote = cover_div['data-background']
+        self.log(f'Granta: cover at {remote}')
+        self._cover_local_path = self._download_image_to_tempfile(remote, suffix='_cover')
+
+    def download_cover(self):
+        '''Override to use the file we pre-fetched in parse_index. The framework
+        accepts a local file path via cover_url (see news.py _download_cover's
+        os.access branch), so just point cover_url at the temp file and let the
+        standard pass handle resizing / output-dir copy.'''
+        if self._cover_local_path and os.access(self._cover_local_path, os.R_OK):
+            self.cover_url = self._cover_local_path
+        super().download_cover()
+
+    # -------------------------------------------------------------------- RSS
+
+    def _build_content_map(self):
+        '''Pull ``NUM_FEED_PAGES`` pages of the WordPress RSS feed and return a
+        dict mapping article URL (no trailing slash) -> the full HTML body
+        from ``<content:encoded>``.'''
+        content_map = {}
+        for page in range(1, self.NUM_FEED_PAGES + 1):
+            url = 'https://granta.com/feed/' if page == 1 else f'https://granta.com/feed/?paged={page}'
+            try:
+                raw = self.browser.open(url).read()
+            except Exception as e:
+                self.log.warning(f'Granta feed page {page} fetch failed: {e}')
+                continue
+            for entry in parse_feed(raw).get('entries', []):
+                link = entry.get('link', '').rstrip('/')
+                if not link:
+                    continue
+                body = (
+                    entry['content'][0]['value'] if entry.get('content')
+                    else entry.get('summary', '')
+                )
+                if body:
+                    content_map[link] = body
+        self.log(f'Granta: collected {len(content_map)} article bodies from RSS')
+        return content_map
+
+    # ------------------------------------------------- image pre-fetch / inline
 
     def _fetch_thumbnails(self):
         '''Pre-fetch each article's thumbnail image and return a dict mapping
-        article URL -> data: URL. Calibre's image fetcher would otherwise
-        download these in parallel and get most of them Cloudflare-challenged;
-        sequential fetches with a few seconds of spacing avoid the rate limit.'''
-        import base64
-        import time
+        article URL -> base64 data URL. Calibre's image fetcher would otherwise
+        download these in a parallel thread pool after parse_index and get most
+        Cloudflare-challenged; sequential fetches with a few seconds of spacing
+        stay under the rate limit without solving the JS challenge.'''
+        with_thumb = [
+            (article_url, meta['thumbnail'])
+            for article_url, meta in self._article_meta.items()
+            if meta.get('thumbnail')
+        ]
+        self.log(f'Granta: fetching {len(with_thumb)} thumbnails sequentially')
         thumbs = {}
-        with_thumb = [(u, m) for u, m in self._article_meta.items() if m.get('thumbnail')]
-        self.log('Granta: fetching %d thumbnails sequentially' % len(with_thumb))
-        for i, (article_url, meta) in enumerate(with_thumb):
+        for i, (article_url, thumb_url) in enumerate(with_thumb):
             if i > 0:
                 time.sleep(self.IMAGE_FETCH_DELAY)
-            thumb_url = meta['thumbnail']
-            try:
-                body = self.browser.open(thumb_url).read()
-            except Exception as e:
-                self.log.warning('  thumbnail fetch failed for %s: %s' % (thumb_url, e))
-                continue
-            if not body or body[:200].startswith(b'<') or b'Just a moment' in body[:500]:
-                self.log.warning('  thumbnail challenged or non-image: %s' % thumb_url)
-                continue
-            ext = thumb_url.rsplit('.', 1)[-1].lower()
-            mime = {
-                'png': 'image/png',
-                'webp': 'image/webp',
-                'gif': 'image/gif',
-            }.get(ext, 'image/jpeg')
-            thumbs[article_url] = 'data:%s;base64,%s' % (mime, base64.b64encode(body).decode('ascii'))
-        self.log('Granta: %d/%d thumbnails captured' % (len(thumbs), len(with_thumb)))
+            data_url = self._fetch_as_data_url(thumb_url)
+            if data_url is not None:
+                thumbs[article_url] = data_url
+        self.log(f'Granta: {len(thumbs)}/{len(with_thumb)} thumbnails captured')
         return thumbs
 
     def _inline_images_into_bodies(self):
-        '''Some RSS bodies contain inline <img> tags pointing to
-        granta.com/wp-content/. Calibre's downloader would otherwise fetch
-        those in parallel after parse_index and get a chunk Cloudflare-
-        challenged, leaving broken images in the EPUB. Pre-fetch each one
-        sequentially with delay and rewrite the bodies to embed them as base64
-        data URLs so calibre never re-fetches.'''
-        import base64
-        import time
-        img_url_re = re.compile(r'<img[^>]+src=["\'](https?://granta\.com/wp-content/[^"\']+)["\']', re.IGNORECASE)
-        urls = set()
-        for body in self._content_map.values():
-            for u in img_url_re.findall(body):
-                urls.add(u)
+        '''Some RSS bodies (mostly Art & Photography pieces, podcasts) carry
+        inline <img> tags pointing at granta.com/wp-content/. Calibre's
+        downloader would follow those in a parallel thread pool after
+        parse_index and get a chunk Cloudflare-challenged, leaving "Not a valid
+        image" stubs in the EPUB. Pre-fetch each unique URL sequentially with
+        delay and substitute the src in the body HTML with a data URL.'''
+        urls = sorted({
+            src for body in self._content_map.values()
+            for src in _GRANTA_IMG_RE.findall(body)
+        })
         if not urls:
             return
-        urls = sorted(urls)
-        self.log('Granta: fetching %d inline article images sequentially' % len(urls))
+        self.log(f'Granta: fetching {len(urls)} inline article images sequentially')
         url_to_data = {}
         for i, url in enumerate(urls):
             if i > 0:
                 time.sleep(self.IMAGE_FETCH_DELAY)
-            try:
-                body = self.browser.open(url).read()
-            except Exception as e:
-                self.log.warning('  inline image fetch failed for %s: %s' % (url, e))
-                continue
-            if not body or body[:200].startswith(b'<') or b'Just a moment' in body[:500]:
-                self.log.warning('  inline image challenged: %s' % url)
-                continue
-            ext = url.rsplit('.', 1)[-1].lower().split('?')[0]
-            mime = {
-                'png': 'image/png',
-                'webp': 'image/webp',
-                'gif': 'image/gif',
-            }.get(ext, 'image/jpeg')
-            url_to_data[url] = 'data:%s;base64,%s' % (mime, base64.b64encode(body).decode('ascii'))
-        self.log('Granta: %d/%d inline images captured' % (len(url_to_data), len(urls)))
+            data_url = self._fetch_as_data_url(url)
+            if data_url is not None:
+                url_to_data[url] = data_url
+        self.log(f'Granta: {len(url_to_data)}/{len(urls)} inline images captured')
         if not url_to_data:
             return
-        # Rewrite each body in self._content_map, replacing fetched URLs with data URLs.
-        for article_url, body in list(self._content_map.items()):
-            def replace(m, body=body):
-                src = m.group(1)
-                data_url = url_to_data.get(src)
-                if data_url is None:
-                    return m.group(0)
-                return m.group(0).replace(src, data_url)
-            self._content_map[article_url] = img_url_re.sub(replace, body)
+        for article_url, body in self._content_map.items():
+            for src, data_url in url_to_data.items():
+                body = body.replace(src, data_url)
+            self._content_map[article_url] = body
+
+    def _fetch_as_data_url(self, url):
+        '''Fetch ``url`` via the (webengine) browser. Return a base64 data: URL
+        if the bytes parse as an image, ``None`` on any failure or challenge.'''
+        try:
+            data = self.browser.open(url).read()
+        except Exception as e:
+            self.log.warning(f'  image fetch failed for {url}: {e}')
+            return None
+        if not data:
+            self.log.warning(f'  empty response: {url}')
+            return None
+        try:
+            image_from_data(data)
+        except NotImage:
+            self.log.warning(f'  image challenged or non-image: {url}')
+            return None
+        ext = url.rsplit('.', 1)[-1].lower().split('?')[0]
+        mime = _EXT_TO_MIME.get(ext, 'image/jpeg')
+        return f'data:{mime};base64,{base64.b64encode(data).decode("ascii")}'
+
+    def _download_image_to_tempfile(self, url, suffix=''):
+        '''Download ``url`` to a ``PersistentTemporaryFile`` (auto-cleaned at
+        program exit) and return the path, or ``None`` on failure.'''
+        try:
+            data = self.browser.open(url).read()
+        except Exception as e:
+            self.log.warning(f'Granta: image fetch failed for {url}: {e}')
+            return None
+        try:
+            image_from_data(data)
+        except NotImage:
+            self.log.warning(f'Granta: image challenged or non-image: {url}')
+            return None
+        ext = url.rsplit('.', 1)[-1].lower().split('?')[0]
+        if ext not in _EXT_TO_MIME:
+            ext = 'jpg'
+        with PersistentTemporaryFile(suffix=f'{suffix}.{ext}', prefix='granta_') as f:
+            f.write(data)
+            return f.name
+
+    # ---------------------------------------------------------- article output
 
     def get_obfuscated_article(self, url):
-        meta = self._article_meta.get(url, {})
+        meta = self._article_meta.get(url)
+        if meta is None:
+            self.abort_article(f'No metadata for {url}; issue page layout may have changed.')
+        title = meta.get('title') or ''
         body = self._content_map.get(url.rstrip('/'), '')
-        parts = ['<html><head><meta charset="utf-8"/><title>']
-        parts.append(meta.get('title', 'Granta'))
-        parts.append('</title></head><body>')
-        parts.append('<h1>%s</h1>' % meta.get('title', ''))
+        if not title and not body:
+            self.abort_article(f'Empty article shell for {url}; nothing to render.')
+
+        parts = [
+            '<html><head><meta charset="utf-8"/>',
+            f'<title>{title}</title>',
+            '</head><body>',
+        ]
+        if title:
+            parts.append(f'<h1>{title}</h1>')
         if meta.get('author'):
-            parts.append('<h3>%s</h3>' % meta['author'])
+            parts.append(f'<h3>{meta["author"]}</h3>')
         thumb_src = self._thumbnail_data.get(url) or meta.get('thumbnail')
         if thumb_src:
-            parts.append('<p><img src="%s" alt=""/></p>' % thumb_src)
+            parts.append(f'<p><img src="{thumb_src}" alt=""/></p>')
         if body:
             parts.append(body)
         else:
             parts.append(
                 '<p><em>This article is not available in the Granta RSS feed cache. '
-                'Read the full piece at <a href="%s">%s</a>.</em></p>' % (url, url))
+                f'Read the full piece at <a href="{url}">{url}</a>.</em></p>'
+            )
         parts.append('</body></html>')
         return {'data': ''.join(parts), 'url': url}
