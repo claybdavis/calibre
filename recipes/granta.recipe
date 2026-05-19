@@ -168,6 +168,10 @@ class Granta(BasicNewsRecipe):
 
     needs_subscription = 'optional'
 
+    browser_type = 'webengine'
+    simultaneous_downloads = 1
+    delay = 2
+
     keep_only_tags = [
         classes(
             'article-header article-content article-feature-image-standard-container article-feature-image-full-width-container'
@@ -218,6 +222,13 @@ class Granta(BasicNewsRecipe):
 
             # Get latest issue
             issueInfo = soup.find(**classes('explore-issue-result'))
+            if issueInfo is None:
+                title = soup.find('title')
+                if title is not None and 'Just a moment' in self.tag_to_string(title):
+                    raise ValueError(
+                        'granta.com served a Cloudflare challenge instead of the issues index. '
+                        'Try running the recipe again in a few minutes.')
+                raise ValueError('Could not find issue link on https://granta.com/issues (page layout may have changed)')
             issueAnchor = issueInfo.findParent('a', href=True)
             issueLink = issueAnchor.get('href')
         else:
